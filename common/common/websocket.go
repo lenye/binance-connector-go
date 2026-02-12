@@ -550,6 +550,7 @@ func (w *WebSocketCommon) configureConnection(conn *websocket.Conn, connection *
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
 	})
 
+	connection.Done = make(chan struct{})
 	connection.Websocket = conn
 	connection.Connected = OPEN
 }
@@ -560,12 +561,16 @@ func (w *WebSocketCommon) configureConnection(conn *websocket.Conn, connection *
 // @param config The WebSocketConfig containing configuration details.
 // @param userAgent The user agent string to use for the connection.
 func (w *WebSocketCommon) KeepAlive(connection *WebSocketConnection, config WebSocketConfig, userAgent string) {
-	ticker := time.NewTicker(23 * time.Hour)
-	defer ticker.Stop()
+	// 每秒检查一次状态，使用 Timer 而非 Ticker，确保不重叠
+	timer := time.NewTimer(1 * time.Second)
+	defer timer.Stop()
+
+	const targetInterval = 23 * time.Hour
+	startTime := time.Now()
 
 	reconnectDelay := config.GetReconnectDelay()
 
-	for range ticker.C {
+	for range timer.C {
 		if !connection.IsHealthy() {
 			log.Printf("WebSocket connection ID: %s is not ready", connection.Id)
 			return
@@ -576,21 +581,25 @@ func (w *WebSocketCommon) KeepAlive(connection *WebSocketConnection, config WebS
 			return
 		}
 
-		connection.Connected = CLOSING
-		time.Sleep(reconnectDelay)
+		if time.Since(startTime) >= targetInterval {
+			// 达到 23 小时，执行重连
+			connection.Connected = CLOSING
+			w.logoutIfNeeded(connection)
+			close(connection.Done)
+			if err := connection.Websocket.Close(); err != nil {
+				log.Printf("Failed to close WebSocket: %v", err)
+			}
 
-		w.logoutIfNeeded(connection)
+			time.Sleep(reconnectDelay)
 
-		close(connection.Done)
-		connection.Done = make(chan struct{})
-		if err := connection.Websocket.Close(); err != nil {
-			log.Printf("Failed to close WebSocket: %v", err)
+			err := w.reconnect(connection, config, userAgent)
+			if err != nil {
+				log.Printf("WebSocket reconnection failed for connection ID: %s, error: %v", connection.Id, err)
+				return
+			}
+			startTime = time.Now()
 		}
-		err := w.reconnect(connection, config, userAgent)
-		if err != nil {
-			log.Printf("WebSocket reconnection failed for connection ID: %s, error: %v", connection.Id, err)
-			return
-		}
+		timer.Reset(1 * time.Second)
 	}
 }
 
